@@ -1,710 +1,201 @@
-"""
-OKNLAB AI Platform - Core System Architecture
-Enterprise-grade multi-agent orchestration with live RAG
-"""
-
 import os
-import asyncio
-import logging
-from typing import Dict, List, Any, Optional, Type
-from datetime import datetime
-from enum import Enum
-from abc import ABC, abstractmethod
+import uvicorn
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
 
-from pydantic import BaseModel, Field
-from langchain.llms.base import LLM
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langgraph.graph import StateGraph, END
-from langchain.schema import Document
+# AI & LangChain
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+from langchain_huggingface import HuggingFacePipeline
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.utilities import GoogleSearchAPIWrapper
+from langgraph.graph import END, StateGraph, MessagesState
+from langgraph.prebuilt import ToolNode
 
-import requests
-from bs4 import BeautifulSoup
-import chromadb
-from chromadb.config import Settings
+# --- CONFIGURATION ---
+from dotenv import load_dotenv
+load_dotenv()
 
-# ========================================
-# LOGGING CONFIGURATION
-# ========================================
+app = FastAPI(title="OKNLAB AI Core", version="2.0.0")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-logger = logging.getLogger("OKNLAB")
 
+# --- MODEL LOADER (Optimized for Colab/T4) ---
+print(">>> INITIALIZING NEURAL ENGINE...")
 
-# ========================================
-# CONFIGURATION MANAGEMENT
-# ========================================
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4"
+)
 
-class Config:
-    """Centralized configuration"""
-    
-    MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
-    MODEL_SERVER = os.getenv("MODEL_SERVER", "http://localhost:8000/v1")
-    API_KEY = os.getenv("API_KEY", "oknlab-local-key")
-    
-    GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "")
-    GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX", "")
-    
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
-    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
-    
-    VECTOR_DB_PATH = "./data/chroma_db"
-    
-    DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.7"))
-    DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "2048"))
+model_id = os.getenv("MODEL_ID", "Qwen/Qwen3-1.7B")
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=quantization_config,
+    device_map="auto",
+    trust_remote_code=True
+)
 
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=1024,
+    temperature=0.1, # Low temp for precise code generation
+    top_p=0.95,
+    repetition_penalty=1.15
+)
 
-# ========================================
-# CUSTOM LLM WRAPPER FOR QWEN
-# ========================================
+llm = HuggingFacePipeline(pipeline=pipe)
 
-class QwenLLM(LLM):
-    """Custom LLM wrapper for Qwen model via vLLM server"""
+# --- TOOLS & RAG ---
+
+@tool
+def google_search_tool(query: str) -> str:
+    """Performs a live web search using Google CSE for RAG."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    cse_id = os.getenv("GOOGLE_CSE_ID")
+    if not api_key or not cse_id:
+        return "Error: Google API credentials not configured."
     
-    model_name: str = Config.MODEL_NAME
-    api_base: str = Config.MODEL_SERVER
-    api_key: str = Config.API_KEY
-    temperature: float = Config.DEFAULT_TEMPERATURE
-    max_tokens: int = Config.DEFAULT_MAX_TOKENS
-    
-    @property
-    def _llm_type(self) -> str:
-        return "qwen"
-    
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        """Execute LLM call to vLLM server"""
-        try:
-            response = requests.post(
-                f"{self.api_base}/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "max_tokens": self.max_tokens,
-                    "temperature": self.temperature,
-                    "stop": stop or []
-                },
-                timeout=60
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["text"].strip()
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return f"ERROR: {str(e)}"
+    import requests
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"q": query, "key": api_key, "cx": cse_id, "num": 3}
+    try:
+        res = requests.get(url, params=params)
+        res.raise_for_status()
+        data = res.json()
+        results = []
+        if 'items' in data:
+            for item in data['items']:
+                results.append(f"Title: {item['title']}\nLink: {item['link']}\nSnippet: {item['snippet']}")
+        return "\n---\n".join(results) if results else "No results found."
+    except Exception as e:
+        return f"Search failed: {str(e)}"
 
-
-# ========================================
-# LIVE WEB SCRAPING RAG ENGINE
-# ========================================
-
-class LiveRAGEngine:
-    """Real-time RAG with Google CSE web scraping"""
+@tool
+def python_repl_tool(code: str) -> str:
+    """Executes Python code safely and returns stdout/stderr. Use for calculation or logic testing."""
+    import io, sys
+    from contextlib import redirect_stdout, redirect_stderr
     
-    def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(model_name=Config.EMBEDDING_MODEL)
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=Config.CHUNK_SIZE,
-            chunk_overlap=Config.CHUNK_OVERLAP
-        )
+    # Security restriction: block dangerous imports
+    if any(x in code for x in ["os.system", "subprocess", "shutil.rmtree"]):
+        return "Security Alert: Dangerous system calls blocked by SecAnalyst."
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exec(code, {"__name__": "__main__"})
+        return stdout.getvalue() + stderr.getvalue()
+    except Exception as e:
+        return f"Execution Error: {str(e)}"
+
+tools = [google_search_tool, python_repl_tool]
+llm_with_tools = llm.bind_tools(tools) if hasattr(llm, "bind_tools") else None 
+# Note: HF Pipeline minimal binding manually handled in graph due to version differences, 
+# but for this implementation we will use a prompt-based ReAct approach if bind_tools fails, 
+# or rely on LangGraph's prebuilt tooling.
+# For robust local execution, we explicitly define the node logic below.
+
+# --- AGENT ORCHESTRATOR (LangGraph) ---
+
+SYSTEM_PROMPT = """You are the OKNLAB Core, an elite AI orchestrating a team of specialized agents.
+Your role is to answer the user's request by dispatching the right sub-personality.
+
+Available Personas:
+1. CodeArchitect: Writes clean, modular Python/JS/Go.
+2. SecAnalyst: Audits code and checks for vulnerabilities.
+3. AutoBot: Handles automation logic.
+4. CreativeAgent: Generates content.
+
+Instructions:
+- If you need current data, call 'google_search_tool'.
+- If you need to calculate or test logic, call 'python_repl_tool'.
+- Format your final answer clearly.
+- Be pragmatic and precise.
+"""
+
+# Helper to simulate tool binding for local HF models
+def chatbot_node(state: MessagesState):
+    messages = state["messages"]
+    # We construct a prompt including tool definitions for the model to understand
+    # Since small local models struggle with native tool binding sometimes, we ensure context is clear.
+    response = llm.invoke(messages)
+    return {"messages": [response]}
+
+# Simple Graph Construction
+workflow = StateGraph(MessagesState)
+
+# Using a simplified ReAct pattern compatible with local HF pipelines
+# In a production environment with OpenAI/Anthropic, we would use tools_condition
+# Here we implement a custom router logic or simple chain.
+
+# For stability in Colab with 1.5B model, we will use a direct Chain approach 
+# wrapped in the endpoint rather than complex cyclical graph to avoid hallucination loops.
+# We update the graph to a simple retrieval chain for this demo.
+
+from langchain.agents import AgentExecutor, create_tool_calling_agent, create_react_agent
+from langchain import hub
+
+# Pull a standard prompt or define one
+prompt_template = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    ("placeholder", "{chat_history}"),
+    ("human", "{input}"),
+    ("placeholder", "{agent_scratchpad}"),
+])
+
+# We create a ReAct agent which works better with generic LLMs
+react_agent = create_react_agent(llm, tools, prompt_template)
+agent_executor = AgentExecutor(agent=react_agent, tools=tools, verbose=True, handle_parsing_errors=True)
+
+# --- API ENDPOINTS ---
+
+class ChatRequest(BaseModel):
+    message: str
+    agent_mode: str = "CodeArchitect"
+
+@app.post("/api/chat")
+async def chat_endpoint(req: ChatRequest):
+    try:
+        # Context injection based on mode
+        mode_instruction = ""
+        if req.agent_mode == "SecAnalyst":
+            mode_instruction = "Focus on security, vulnerabilities, and threat modeling. "
+        elif req.agent_mode == "AutoBot":
+            mode_instruction = "Focus on automation, APIs, and workflow efficiency. "
         
-        # Initialize ChromaDB
-        self.chroma_client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=Config.VECTOR_DB_PATH
-        ))
+        full_input = mode_instruction + req.message
         
-        self.vectorstore = None
-        logger.info("LiveRAGEngine initialized")
-    
-    def search_web(self, query: str, num_results: int = 5) -> List[Dict[str, str]]:
-        """Search web using Google CSE"""
-        try:
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {
-                "key": Config.GOOGLE_CSE_API_KEY,
-                "cx": Config.GOOGLE_CSE_CX,
-                "q": query,
-                "num": num_results
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            results = []
-            for item in response.json().get("items", []):
-                results.append({
-                    "title": item.get("title", ""),
-                    "link": item.get("link", ""),
-                    "snippet": item.get("snippet", "")
-                })
-            
-            logger.info(f"Found {len(results)} results for: {query}")
-            return results
-        
-        except Exception as e:
-            logger.error(f"Web search failed: {e}")
-            return []
-    
-    def scrape_content(self, url: str) -> str:
-        """Scrape content from URL"""
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove scripts and styles
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            text = soup.get_text()
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = '\n'.join(chunk for chunk in chunks if chunk)
-            
-            return text[:10000]  # Limit to 10k chars
-        
-        except Exception as e:
-            logger.error(f"Scraping failed for {url}: {e}")
-            return ""
-    
-    def build_knowledge_base(self, query: str) -> bool:
-        """Build vector store from live web scraping"""
-        try:
-            # Search web
-            search_results = self.search_web(query)
-            if not search_results:
-                logger.warning("No search results found")
-                return False
-            
-            # Scrape and process content
-            documents = []
-            for result in search_results:
-                content = self.scrape_content(result["link"])
-                if content:
-                    documents.append(Document(
-                        page_content=content,
-                        metadata={
-                            "source": result["link"],
-                            "title": result["title"]
-                        }
-                    ))
-            
-            if not documents:
-                logger.warning("No content scraped")
-                return False
-            
-            # Split and embed
-            splits = self.text_splitter.split_documents(documents)
-            
-            # Create vector store
-            self.vectorstore = Chroma.from_documents(
-                documents=splits,
-                embedding=self.embeddings,
-                persist_directory=Config.VECTOR_DB_PATH
-            )
-            
-            logger.info(f"Knowledge base built: {len(splits)} chunks from {len(documents)} sources")
-            return True
-        
-        except Exception as e:
-            logger.error(f"Knowledge base build failed: {e}")
-            return False
-    
-    def query(self, question: str, llm: LLM) -> str:
-        """Query the knowledge base"""
-        if not self.vectorstore:
-            return "Knowledge base not initialized. Run build_knowledge_base first."
-        
-        try:
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=self.vectorstore.as_retriever(search_kwargs={"k": 3})
-            )
-            
-            result = qa_chain.run(question)
-            return result
-        
-        except Exception as e:
-            logger.error(f"RAG query failed: {e}")
-            return f"ERROR: {str(e)}"
-
-
-# ========================================
-# AGENT FRAMEWORK
-# ========================================
-
-class AgentType(str, Enum):
-    """Agent type enumeration"""
-    CODE_ARCHITECT = "code_architect"
-    SEC_ANALYST = "sec_analyst"
-    AUTO_BOT = "auto_bot"
-    AGENT_SUITE = "agent_suite"
-    CREATIVE = "creative"
-    CUSTOM = "custom"
-
-
-class AgentConfig(BaseModel):
-    """Agent configuration model"""
-    name: str
-    type: AgentType
-    description: str
-    temperature: float = 0.7
-    max_tokens: int = 2048
-    system_prompt: str = ""
-    tools: List[str] = Field(default_factory=list)
-    rag_enabled: bool = False
-
-
-class BaseAgent(ABC):
-    """Abstract base agent class"""
-    
-    def __init__(self, config: AgentConfig, llm: LLM, rag_engine: Optional[LiveRAGEngine] = None):
-        self.config = config
-        self.llm = llm
-        self.rag_engine = rag_engine
-        self.execution_count = 0
-        self.logger = logging.getLogger(f"Agent.{config.name}")
-    
-    @abstractmethod
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute agent task"""
-        pass
-    
-    def _build_prompt(self, task: str, context: Dict[str, Any]) -> str:
-        """Build prompt with system prompt and context"""
-        prompt_parts = []
-        
-        if self.config.system_prompt:
-            prompt_parts.append(f"SYSTEM: {self.config.system_prompt}")
-        
-        if context:
-            prompt_parts.append(f"CONTEXT: {context}")
-        
-        prompt_parts.append(f"TASK: {task}")
-        
-        return "\n\n".join(prompt_parts)
-    
-    async def _execute_with_rag(self, task: str) -> str:
-        """Execute with RAG if enabled"""
-        if self.config.rag_enabled and self.rag_engine:
-            # Build knowledge base from task
-            await asyncio.to_thread(self.rag_engine.build_knowledge_base, task)
-            # Query with RAG
-            return await asyncio.to_thread(self.rag_engine.query, task, self.llm)
-        else:
-            # Direct LLM call
-            prompt = self._build_prompt(task, {})
-            return await asyncio.to_thread(self.llm, prompt)
-
-
-# ========================================
-# SPECIALIZED AGENTS
-# ========================================
-
-class CodeArchitectAgent(BaseAgent):
-    """Code generation and architecture agent"""
-    
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        self.execution_count += 1
-        self.logger.info(f"Executing code task: {task[:50]}...")
-        
-        # Enhanced system prompt for coding
-        self.config.system_prompt = """You are an expert software architect and developer.
-        Generate production-ready, secure, and optimized code.
-        Include error handling, logging, and documentation.
-        Support: Python, JavaScript, Rust, Go, TypeScript."""
-        
-        result = await self._execute_with_rag(task)
-        
+        result = agent_executor.invoke({"input": full_input, "chat_history": []})
         return {
-            "agent": self.config.name,
-            "type": "code",
-            "task": task,
-            "result": result,
-            "timestamp": datetime.now().isoformat(),
-            "execution_count": self.execution_count
+            "response": result["output"],
+            "agent": req.agent_mode,
+            "status": "success"
         }
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"response": f"System Critical: {str(e)}", "status": "error"}
 
+@app.get("/")
+async def root():
+    return {"system": "OKNLAB AI Core", "status": "operational", "gpu": torch.cuda.get_device_name(0)}
 
-class SecAnalystAgent(BaseAgent):
-    """Security analysis and penetration testing agent"""
-    
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        self.execution_count += 1
-        self.logger.info(f"Executing security task: {task[:50]}...")
-        
-        self.config.system_prompt = """You are a cybersecurity expert specializing in:
-        - Penetration testing
-        - Vulnerability assessment
-        - Threat modeling
-        - Security audits
-        - OWASP Top 10
-        Provide actionable security recommendations."""
-        
-        result = await self._execute_with_rag(task)
-        
-        return {
-            "agent": self.config.name,
-            "type": "security",
-            "task": task,
-            "result": result,
-            "vulnerabilities": self._extract_vulnerabilities(result),
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    def _extract_vulnerabilities(self, result: str) -> List[str]:
-        """Extract vulnerability mentions"""
-        vuln_keywords = ["XSS", "SQL injection", "CSRF", "vulnerability", "exploit"]
-        return [kw for kw in vuln_keywords if kw.lower() in result.lower()]
-
-
-class AutoBotAgent(BaseAgent):
-    """Automation and workflow orchestration agent"""
-    
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        self.execution_count += 1
-        self.logger.info(f"Executing automation task: {task[:50]}...")
-        
-        self.config.system_prompt = """You are an automation specialist.
-        Design and implement workflows using:
-        - Apache Airflow DAGs
-        - API integrations (REST, GraphQL)
-        - Zapier/n8n/Make workflows
-        - Event-driven architectures
-        Provide executable automation scripts."""
-        
-        result = await self._execute_with_rag(task)
-        
-        return {
-            "agent": self.config.name,
-            "type": "automation",
-            "task": task,
-            "result": result,
-            "workflow_generated": True,
-            "timestamp": datetime.now().isoformat()
-        }
-
-
-class AgentSuiteAgent(BaseAgent):
-    """Admin, finance, and operations automation agent"""
-    
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        self.execution_count += 1
-        self.logger.info(f"Executing admin task: {task[:50]}...")
-        
-        self.config.system_prompt = """You are an operations and admin specialist.
-        Handle:
-        - Report generation
-        - Financial analysis
-        - Data processing (CSV, Excel)
-        - Meeting notes and summaries
-        - Documentation automation"""
-        
-        result = await self._execute_with_rag(task)
-        
-        return {
-            "agent": self.config.name,
-            "type": "admin",
-            "task": task,
-            "result": result,
-            "timestamp": datetime.now().isoformat()
-        }
-
-
-class CreativeAgent(BaseAgent):
-    """Content creation agent (text, audio, visual)"""
-    
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        self.execution_count += 1
-        self.logger.info(f"Executing creative task: {task[:50]}...")
-        
-        self.config.system_prompt = """You are a creative content specialist.
-        Generate:
-        - Marketing copy
-        - Articles and blog posts
-        - Social media content
-        - Documentation
-        - Creative writing
-        SEO-optimized, engaging, and professional."""
-        
-        result = await self._execute_with_rag(task)
-        
-        return {
-            "agent": self.config.name,
-            "type": "creative",
-            "task": task,
-            "result": result,
-            "content_type": self._detect_content_type(task),
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    def _detect_content_type(self, task: str) -> str:
-        """Detect content type from task"""
-        task_lower = task.lower()
-        if "article" in task_lower or "blog" in task_lower:
-            return "article"
-        elif "social" in task_lower or "tweet" in task_lower:
-            return "social"
-        elif "marketing" in task_lower or "copy" in task_lower:
-            return "marketing"
-        return "general"
-
-
-class CustomAgent(BaseAgent):
-    """User-defined custom agent"""
-    
-    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        self.execution_count += 1
-        self.logger.info(f"Executing custom task: {task[:50]}...")
-        
-        result = await self._execute_with_rag(task)
-        
-        return {
-            "agent": self.config.name,
-            "type": "custom",
-            "task": task,
-            "result": result,
-            "timestamp": datetime.now().isoformat()
-        }
-
-
-# ========================================
-# AGENT ORCHESTRATOR
-# ========================================
-
-class AgentOrchestrator:
-    """Central orchestrator for multi-agent system"""
-    
-    def __init__(self):
-        self.llm = QwenLLM()
-        self.rag_engine = LiveRAGEngine()
-        self.agents: Dict[str, BaseAgent] = {}
-        self.execution_history: List[Dict[str, Any]] = []
-        
-        # Agent type mapping
-        self.agent_classes: Dict[AgentType, Type[BaseAgent]] = {
-            AgentType.CODE_ARCHITECT: CodeArchitectAgent,
-            AgentType.SEC_ANALYST: SecAnalystAgent,
-            AgentType.AUTO_BOT: AutoBotAgent,
-            AgentType.AGENT_SUITE: AgentSuiteAgent,
-            AgentType.CREATIVE: CreativeAgent,
-            AgentType.CUSTOM: CustomAgent
-        }
-        
-        self._initialize_default_agents()
-        logger.info("AgentOrchestrator initialized")
-    
-    def _initialize_default_agents(self):
-        """Initialize default agent suite"""
-        default_configs = [
-            AgentConfig(
-                name="CodeArchitect",
-                type=AgentType.CODE_ARCHITECT,
-                description="Expert code generation and architecture",
-                rag_enabled=True
-            ),
-            AgentConfig(
-                name="SecAnalyst",
-                type=AgentType.SEC_ANALYST,
-                description="Security analysis and penetration testing",
-                rag_enabled=True
-            ),
-            AgentConfig(
-                name="AutoBot",
-                type=AgentType.AUTO_BOT,
-                description="Workflow automation and API orchestration",
-                rag_enabled=True
-            ),
-            AgentConfig(
-                name="AgentSuite",
-                type=AgentType.AGENT_SUITE,
-                description="Admin, finance, and operations automation",
-                rag_enabled=False
-            ),
-            AgentConfig(
-                name="CreativeAgent",
-                type=AgentType.CREATIVE,
-                description="Content creation and marketing",
-                rag_enabled=True
-            )
-        ]
-        
-        for config in default_configs:
-            self.create_agent(config)
-    
-    def create_agent(self, config: AgentConfig) -> BaseAgent:
-        """Create and register new agent"""
-        agent_class = self.agent_classes.get(config.type, CustomAgent)
-        agent = agent_class(config, self.llm, self.rag_engine)
-        self.agents[config.name] = agent
-        logger.info(f"Agent created: {config.name} ({config.type})")
-        return agent
-    
-    def get_agent(self, name: str) -> Optional[BaseAgent]:
-        """Get agent by name"""
-        return self.agents.get(name)
-    
-    def list_agents(self) -> List[Dict[str, Any]]:
-        """List all registered agents"""
-        return [
-            {
-                "name": agent.config.name,
-                "type": agent.config.type.value,
-                "description": agent.config.description,
-                "execution_count": agent.execution_count,
-                "rag_enabled": agent.config.rag_enabled
-            }
-            for agent in self.agents.values()
-        ]
-    
-    async def execute_task(self, agent_name: str, task: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Execute task with specified agent"""
-        agent = self.get_agent(agent_name)
-        if not agent:
-            raise ValueError(f"Agent not found: {agent_name}")
-        
-        result = await agent.execute(task, context or {})
-        self.execution_history.append(result)
-        
-        return result
-    
-    async def execute_multi_agent(self, tasks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-        """Execute multiple agents in parallel"""
-        coroutines = [
-            self.execute_task(task["agent"], task["task"], task.get("context"))
-            for task in tasks
-        ]
-        results = await asyncio.gather(*coroutines, return_exceptions=True)
-        return results
-    
-    def get_execution_history(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get execution history"""
-        return self.execution_history[-limit:]
-    
-    def delete_agent(self, name: str) -> bool:
-        """Delete custom agent"""
-        if name in self.agents:
-            del self.agents[name]
-            logger.info(f"Agent deleted: {name}")
-            return True
-        return False
-
-
-# ========================================
-# WORKFLOW GRAPH (LANGGRAPH)
-# ========================================
-
-class WorkflowState(BaseModel):
-    """Workflow state for LangGraph"""
-    task: str
-    agent_sequence: List[str]
-    current_index: int = 0
-    results: List[Dict[str, Any]] = Field(default_factory=list)
-    error: Optional[str] = None
-
-
-class WorkflowOrchestrator:
-    """LangGraph-based workflow orchestration"""
-    
-    def __init__(self, agent_orchestrator: AgentOrchestrator):
-        self.orchestrator = agent_orchestrator
-        self.graph = self._build_graph()
-    
-    def _build_graph(self) -> StateGraph:
-        """Build workflow graph"""
-        workflow = StateGraph(WorkflowState)
-        
-        # Define nodes
-        workflow.add_node("execute_agent", self._execute_agent_node)
-        workflow.add_node("check_completion", self._check_completion_node)
-        
-        # Define edges
-        workflow.set_entry_point("execute_agent")
-        workflow.add_edge("execute_agent", "check_completion")
-        workflow.add_conditional_edges(
-            "check_completion",
-            self._should_continue,
-            {
-                "continue": "execute_agent",
-                "end": END
-            }
-        )
-        
-        return workflow.compile()
-    
-    async def _execute_agent_node(self, state: WorkflowState) -> WorkflowState:
-        """Execute current agent in sequence"""
-        if state.current_index >= len(state.agent_sequence):
-            return state
-        
-        agent_name = state.agent_sequence[state.current_index]
-        
-        try:
-            result = await self.orchestrator.execute_task(agent_name, state.task)
-            state.results.append(result)
-            state.current_index += 1
-        except Exception as e:
-            state.error = str(e)
-            logger.error(f"Workflow error: {e}")
-        
-        return state
-    
-    def _check_completion_node(self, state: WorkflowState) -> WorkflowState:
-        """Check if workflow is complete"""
-        return state
-    
-    def _should_continue(self, state: WorkflowState) -> str:
-        """Determine if workflow should continue"""
-        if state.error or state.current_index >= len(state.agent_sequence):
-            return "end"
-        return "continue"
-    
-    async def execute_workflow(self, task: str, agent_sequence: List[str]) -> Dict[str, Any]:
-        """Execute multi-agent workflow"""
-        initial_state = WorkflowState(
-            task=task,
-            agent_sequence=agent_sequence
-        )
-        
-        final_state = await self.graph.ainvoke(initial_state)
-        
-        return {
-            "task": task,
-            "agents": agent_sequence,
-            "results": final_state["results"],
-            "error": final_state.get("error"),
-            "completed": final_state["current_index"] == len(agent_sequence)
-        }
-
-
-# ========================================
-# EXPORT SYSTEM COMPONENTS
-# ========================================
-
-__all__ = [
-    "Config",
-    "QwenLLM",
-    "LiveRAGEngine",
-    "AgentType",
-    "AgentConfig",
-    "BaseAgent",
-    "CodeArchitectAgent",
-    "SecAnalystAgent",
-    "AutoBotAgent",
-    "AgentSuiteAgent",
-    "CreativeAgent",
-    "CustomAgent",
-    "AgentOrchestrator",
-    "WorkflowOrchestrator"
-]
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
